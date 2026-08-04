@@ -1,0 +1,4 @@
+{"question_id": 81, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接。', None, 10054, None)"}
+{"question_id": 85, "method": "baseline", "order": "forward", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "RuntimeError('Judge API failed after 5 attempts: HTTP Error 503: Service Temporarily Unavailable')"}
+{"question_id": 88, "method": "reason", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "RuntimeError('Judge API failed after 5 attempts: HTTP Error 503: Service Temporarily Unavailable')"}
+{"question_id": 137, "method": "baseline", "order": "forward", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "TimeoutError('no first API output before configured timeout')"}

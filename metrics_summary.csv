@@ -1,0 +1,9 @@
+﻿experiment_condition,n_questions,consistency,flip_rate,accuracy,strong_win_rate,weak_win_rate,tie_rate,forced_tie_rate
+Baseline Forward,79,,,1.0,1.0,0.0,0.0,
+Baseline Reverse,79,,,1.0,1.0,0.0,0.0,
+Baseline Overall,79,1.0,0.0,1.0,1.0,0.0,0.0,
+Swap-then-Merge,79,,,1.0,1.0,0.0,0.0,0.0
+Reason-then-Judge Forward,79,,,1.0,1.0,0.0,0.0,
+Reason-then-Judge Reverse,79,,,1.0,1.0,0.0,0.0,
+Reason-then-Judge Overall,79,1.0,0.0,1.0,1.0,0.0,0.0,
+Reason-then-Judge + Swap-then-Merge,79,,,1.0,1.0,0.0,0.0,0.0
