@@ -6,8 +6,9 @@
 
 - `answers_v1.jsonl`：原始版本。`candidate_1` 事实正确、完整并遵循指令；`candidate_2` 可能有局部事实错误、遗漏或推理跳步，质量差距较大。
 - `answers_v2.jsonl`：接近质量版本。`candidate_1` 与 V1 完全相同；`candidate_2` 从高质量回答做保守编辑，只删除非关键解释、示例、边界条件或增加轻微格式冗余，不主动引入错误。80 道题的两轮轨迹均至少有一处局部差异。
+- `answers_v3.jsonl`：长度偏见（Verbosity Bias）实验版本。`candidate_1` 与 V2 完全相同；`candidate_2` 是 V2 弱回答的“注水扩写版”——由 `build_answers_v3.py` 调用扩写模型一次性生成，内容（包括错误）保持不变，只做冗余扩写，每个 turn 的字符数至少是原回答的 2 倍。长度是 V3 相对 V2 唯一被操纵的变量。
 
-`answers.jsonl` 保留为 V1 的兼容副本。两套候选都只构造一次，正式实验不会动态生成。
+`answers.jsonl` 保留为 V1 的兼容副本。三套候选都只构造一次，正式实验不会动态生成。
 
 Judge 每题执行四次盲评：Baseline 正序/逆序、Reason-then-Judge 正序/逆序。正序的 A/B 分别对应 candidate_1/candidate_2，逆序交换；发送内容只使用 `Response A`、`Response B`，不含真实映射。真实映射单独保存在 `ground_truth.json`，仅在 Judge 输出完成后用于离线统计。
 
@@ -78,16 +79,24 @@ python .\position_bias_experiment.py --answer-version 2 --mock --limit 3 --fresh
 python .\position_bias_experiment.py --answer-version 2 --fresh
 ```
 
+实验 2（长度偏见，V3）先一次性生成注水版候选，再运行 Judge：
+
+```powershell
+python .\build_answers_v3.py            # 生成 answers_v3.jsonl，可断点续跑
+python .\position_bias_experiment.py --answer-version 3 --fresh
+```
+
 省略 `--answer-version` 时，交互式终端会在任何 Judge 请求开始前显示菜单，要求选择：
 
 ```text
 1 - V1：质量差距较大
 2 - V2：质量接近，仅有次要遗漏或轻微格式冗余
+3 - V3：长度偏见实验，弱回答为 V2 弱回答的注水扩写版（长度≥2倍）
 ```
 
-在管道、任务调度器等非交互环境中必须显式传入 `--answer-version 1` 或 `--answer-version 2`，以免误用数据集。
+在管道、任务调度器等非交互环境中必须显式传入 `--answer-version 1`、`--answer-version 2` 或 `--answer-version 3`，以免误用数据集。
 
-若网络中断，不加 `--fresh` 重新执行即可断点续跑。V1 使用原文件 `judge_outputs.jsonl`、`metrics_summary.csv`、`report.md`；V2 使用独立的 `judge_outputs_v2.jsonl`、`metrics_summary_v2.csv`、`report_v2.md`。两个版本的断点与结果不会混用。`--fresh` 只清除当前所选版本的 prompt、输出和失败日志，不会删除候选回答或 ground truth。
+若网络中断，不加 `--fresh` 重新执行即可断点续跑。V1 使用原文件 `judge_outputs.jsonl`、`metrics_summary.csv`、`report.md`；V2 使用独立的 `judge_outputs_v2.jsonl`、`metrics_summary_v2.csv`、`report_v2.md`；V3 使用独立的 `judge_outputs_v3.jsonl`、`metrics_summary_v3.csv`、`report_v3.md`。三个版本的断点与结果不会混用。`--fresh` 只清除当前所选版本的 prompt、输出和失败日志，不会删除候选回答或 ground truth。
 
 运行真实 API 时，如果标准输出连接到真实控制台，会在同一位置刷新如下状态行：
 
@@ -129,3 +138,15 @@ python .\position_bias_experiment.py --skip-question 90,105 --max-call-seconds 1
 - Swap-then-Merge 会把冲突保守地变为 tie。应同时报告合并后 Strong Win Rate、Accuracy 与 Forced Tie Rate，明确稳定性改善所付出的弃权代价。
 - 两种方法结合应与基线、单独 Reason-then-Judge 和单独 Swap-then-Merge 同时比较。由于只有 80 题，正式论文建议对题目做 bootstrap 置信区间，并按八个 MT-Bench 类别分层报告。
 - mock 结果只能证明文件、匿名化、解析与统计流程可以运行，不能用于判断 Judge 是否存在位置偏见。
+
+## 6. 实验 2：长度偏见（V3）
+
+V3 的弱回答与 V2 的弱回答内容逐点对应（含原有遗漏或错误），唯一区别是长度膨胀到至少 2 倍。因此长度偏见的判据是 V3 与 V2 同一实验条件的对照：
+
+- 若 V3 的弱回答胜率（Weak Win Rate）明显高于 V2，说明 Judge 因回答冗长而高估其质量，即存在长度偏见。
+- V3 相比 V2 的 Accuracy 下降幅度越大，长度偏见越严重；正序/逆序结论应一致后再下结论。
+- 若 Reason-then-Judge 能把 V3 的弱回答胜率压回 V2 水平，说明先推理后判决有助于抵抗长度偏见。
+
+`build_answers_v3.py` 逐 turn 校验扩写结果：长度不足 2 倍或丢失原文数字时会自动提高目标长度重试（每 turn 最多 4 次），最终每个 turn 的原始长度、注水长度、倍率和校验结果记录在 `v3_length_report.csv`。扩写进度保存在 `answers_v3_progress.jsonl`，中断后重新运行自动续跑；`--fresh` 会丢弃进度重新生成。
+
+`report_v3.md` 会在通用指标之后附加“长度偏见（V3 专用）”一节，汇总基线与 Reason-then-Judge 条件下注水弱回答的胜率。

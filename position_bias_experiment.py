@@ -57,43 +57,40 @@ SYSTEM_PROMPT = """You are an impartial evaluator. Compare two anonymous respons
 
 
 def configure_answer_version(version: str) -> None:
-    """Select an answer set and keep checkpoints/results isolated by version."""
+    """Select an answer set and keep checkpoints/results isolated by version.
+
+    V3 = verbosity-bias set: candidate_2 is the padded (>=2x length) rewrite
+    of the V2 weak answer, built once by build_answers_v3.py.
+    """
     global ANSWERS_PATH, PROMPTS_PATH, OUTPUTS_PATH, MAPPED_PATH
     global METRICS_PATH, REPORT_PATH, FAILURES_PATH
-    if version == "1":
-        ANSWERS_PATH = ROOT / "answers_v1.jsonl"
-        PROMPTS_PATH = ROOT / "judge_prompts.jsonl"
-        OUTPUTS_PATH = ROOT / "judge_outputs.jsonl"
-        MAPPED_PATH = ROOT / "mapped_results.csv"
-        METRICS_PATH = ROOT / "metrics_summary.csv"
-        REPORT_PATH = ROOT / "report.md"
-        FAILURES_PATH = ROOT / "parse_failures.jsonl"
-    else:
-        ANSWERS_PATH = ROOT / "answers_v2.jsonl"
-        PROMPTS_PATH = ROOT / "judge_prompts_v2.jsonl"
-        OUTPUTS_PATH = ROOT / "judge_outputs_v2.jsonl"
-        MAPPED_PATH = ROOT / "mapped_results_v2.csv"
-        METRICS_PATH = ROOT / "metrics_summary_v2.csv"
-        REPORT_PATH = ROOT / "report_v2.md"
-        FAILURES_PATH = ROOT / "parse_failures_v2.jsonl"
+    suffix = "" if version == "1" else f"_v{version}"
+    ANSWERS_PATH = ROOT / f"answers_v{version}.jsonl"
+    PROMPTS_PATH = ROOT / f"judge_prompts{suffix}.jsonl"
+    OUTPUTS_PATH = ROOT / f"judge_outputs{suffix}.jsonl"
+    MAPPED_PATH = ROOT / f"mapped_results{suffix}.csv"
+    METRICS_PATH = ROOT / f"metrics_summary{suffix}.csv"
+    REPORT_PATH = ROOT / f"report{suffix}.md"
+    FAILURES_PATH = ROOT / f"parse_failures{suffix}.jsonl"
 
 
 def choose_answer_version(cli_value: str | None, parser: argparse.ArgumentParser) -> str:
     if cli_value is not None:
         return cli_value
     if not sys.stdin.isatty():
-        parser.error("非交互环境必须指定 --answer-version 1 或 --answer-version 2")
+        parser.error("非交互环境必须指定 --answer-version 1、2 或 3")
     print("\n请选择本次测评使用的候选回答版本：")
     print("  1 - V1：高质量回答与较弱回答差距较大（保留原实验和断点）")
     print("  2 - V2：两者质量接近，较弱回答仅有次要遗漏或轻微格式冗余")
+    print("  3 - V3：长度偏见实验，弱回答为 V2 弱回答的注水扩写版（长度≥2倍）")
     while True:
         try:
-            value = input("请输入 1 或 2：").strip()
+            value = input("请输入 1、2 或 3：").strip()
         except EOFError:
             parser.error("无法读取交互输入，请使用 --answer-version 指定版本")
-        if value in {"1", "2"}:
+        if value in {"1", "2", "3"}:
             return value
-        print("输入无效，请输入 1 或 2。")
+        print("输入无效，请输入 1、2 或 3。")
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -617,7 +614,9 @@ def fmt(value: Any) -> str:
 def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str) -> None:
     headers = ["experiment_condition", "consistency", "flip_rate", "accuracy",
                "strong_win_rate", "weak_win_rate", "tie_rate", "forced_tie_rate"]
-    lines = ["# LLM Judge 位置偏见实验报告", "",
+    title = ("# LLM Judge 长度偏见实验报告" if answer_version == "3"
+             else "# LLM Judge 位置偏见实验报告")
+    lines = [title, "",
              f"> 运行模式：{'MOCK（仅验证流程，不可作为实验结论）' if mock else '真实 Judge API'}", "",
              f"> 候选回答版本：V{answer_version}", "",
              "## 指标汇总", "", "| 条件 | Consistency | Flip Rate | Accuracy | Strong Win | Weak Win | Tie | Forced Tie |",
@@ -634,6 +633,19 @@ def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str)
               f"- Swap-then-Merge 后强回答胜率为 {fmt(bm['strong_win_rate'])}，强制平局率为 {fmt(bm['forced_tie_rate'])}。它以更多平局换取对冲突结论的保守处理。",
               f"- 两种方法结合后的强回答胜率为 {fmt(rm['strong_win_rate'])}，强制平局率为 {fmt(rm['forced_tie_rate'])}。应与单独干预比较，而不能只看翻转率。",
               "- Accuracy 按全部有效判决中选择 strong 的比例计算；tie 不计正确。题面公式中的第二项应为加号，而非减号。", ""]
+    if answer_version == "3":
+        b_weak = fmt(b["weak_win_rate"])
+        r_weak = fmt(r["weak_win_rate"])
+        lines += [
+            "## 长度偏见（V3 专用）", "",
+            "V3 中弱回答是 V2 弱回答的注水扩写版：内容（含错误）不变，长度≥2 倍。"
+            "判断长度偏见的核心对照是 V3 与 V2 的弱回答胜率之差：",
+            "",
+            f"- 基线弱回答（注水版）胜率为 {b_weak}。若明显高于 V2 同一条件的弱回答胜率，"
+            "说明 Judge 因冗长而高估弱回答，即存在长度偏见。",
+            f"- Reason-then-Judge 的弱回答胜率为 {r_weak}。若该干预能把胜率压回 V2 水平，"
+            "说明先推理后判决有助于抵抗长度偏见。",
+            "- 也可比较 V3 与 V2 的 Accuracy 差值；Accuracy 下降越多，长度偏见越严重。", ""]
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -643,8 +655,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="Run only the first N questions (smoke tests)")
     parser.add_argument("--fresh", action="store_true", help="Start new prompt/output/log files")
     parser.add_argument(
-        "--answer-version", choices=("1", "2"),
-        help="Candidate answer set: 1=larger quality gap, 2=close quality")
+        "--answer-version", choices=("1", "2", "3"),
+        help="Candidate answer set: 1=larger quality gap, 2=close quality, "
+             "3=verbosity bias (weak answer padded to >=2x length)")
     parser.add_argument(
         "--skip-question", action="append", default=[], metavar="ID[,ID]",
         help="Skip one or more complete questions, e.g. --skip-question 90,105")
