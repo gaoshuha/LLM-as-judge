@@ -1,0 +1,5 @@
+{"question_id": 96, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "JSONDecodeError('Unterminated string starting at: line 1 column 24 (char 23)')", "answer_version": "2"}
+{"question_id": 113, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "TimeoutError('no first API output before configured timeout')", "answer_version": "2"}
+{"question_id": 126, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid winner: ''\")", "answer_version": "2"}
+{"question_id": 128, "method": "reason", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid final_winner: '-1'\")", "answer_version": "2"}
+{"question_id": 154, "method": "reason", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid final_winner: ''\")", "answer_version": "2"}

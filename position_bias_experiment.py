@@ -26,9 +26,14 @@ from typing import Any
 
 # =========================================================
 # Step 0: 在这里输入 LLM Judge 的 API Key
+# JUDGE_API_KEY = "PASTE_YOUR_API_KEY_HERE"
+# JUDGE_MODEL_NAME = "deepseek-v4-flash"
+# JUDGE_BASE_URL = "https://api.deepseek.com/v1"
+
 JUDGE_API_KEY = "PASTE_YOUR_API_KEY_HERE"
-JUDGE_MODEL_NAME = "deepseek-v4-flash"
-JUDGE_BASE_URL = "https://api.deepseek.com/v1"
+JUDGE_MODEL_NAME = "google/gemma-4-31b-it"
+JUDGE_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 
 # Reproducibility and reliability settings
 TEMPERATURE = 0
@@ -40,9 +45,11 @@ STATUS_REFRESH_SECONDS = 1.0
 STALL_WARNING_SECONDS = 30.0
 DEFAULT_MAX_CALL_SECONDS = 300.0
 DEFAULT_FIRST_OUTPUT_TIMEOUT_SECONDS = 30.0
+DEFAULT_API_TEST_TIMEOUT_SECONDS = 15.0
 
 
 ROOT = Path(__file__).resolve().parent
+RESULTS_ROOT = ROOT / "results"
 QUESTIONS_PATH = ROOT / "question.jsonl"
 ANSWERS_PATH = ROOT / "answers_v1.jsonl"
 GROUND_TRUTH_PATH = ROOT / "ground_truth.json"
@@ -56,41 +63,91 @@ FAILURES_PATH = ROOT / "parse_failures.jsonl"
 SYSTEM_PROMPT = """You are an impartial evaluator. Compare two anonymous responses to the same user conversation. Judge correctness, relevance, instruction-following, clarity, and completeness. Do not infer authorship or quality from response position, length, style, or the labels A and B. Treat the two positions symmetrically. A tie is allowed only when their overall quality is genuinely indistinguishable. Return valid JSON only."""
 
 
-def configure_answer_version(version: str) -> None:
+def configure_answer_version(version: str, run_name: str | None = None) -> None:
     """Select an answer set and keep checkpoints/results isolated by version.
 
     V3 = verbosity-bias set: candidate_2 is the padded (>=2x length) rewrite
     of the V2 weak answer, built once by build_answers_v3.py.
+    V4 = surface-persuasion set: candidate_2 is the unchanged V2 weak answer
+    wrapped in fixed authority, consensus, style, and compassion cues.
     """
     global ANSWERS_PATH, PROMPTS_PATH, OUTPUTS_PATH, MAPPED_PATH
     global METRICS_PATH, REPORT_PATH, FAILURES_PATH
-    suffix = "" if version == "1" else f"_v{version}"
     ANSWERS_PATH = ROOT / f"answers_v{version}.jsonl"
-    PROMPTS_PATH = ROOT / f"judge_prompts{suffix}.jsonl"
-    OUTPUTS_PATH = ROOT / f"judge_outputs{suffix}.jsonl"
-    MAPPED_PATH = ROOT / f"mapped_results{suffix}.csv"
-    METRICS_PATH = ROOT / f"metrics_summary{suffix}.csv"
-    REPORT_PATH = ROOT / f"report{suffix}.md"
-    FAILURES_PATH = ROOT / f"parse_failures{suffix}.jsonl"
+    if run_name is None:
+        # Keep the original single-version paths compatible with old commands
+        # and existing checkpoints.
+        suffix = "" if version == "1" else f"_v{version}"
+        output_dir = ROOT
+        PROMPTS_PATH = output_dir / f"judge_prompts{suffix}.jsonl"
+        OUTPUTS_PATH = output_dir / f"judge_outputs{suffix}.jsonl"
+        MAPPED_PATH = output_dir / f"mapped_results{suffix}.csv"
+        METRICS_PATH = output_dir / f"metrics_summary{suffix}.csv"
+        REPORT_PATH = output_dir / f"report{suffix}.md"
+        FAILURES_PATH = output_dir / f"parse_failures{suffix}.jsonl"
+        return
+
+    if not re.fullmatch(r"V[1-4]R[1-9][0-9]*", run_name):
+        raise ValueError(f"Invalid experiment run name: {run_name!r}")
+    output_dir = RESULTS_ROOT / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    PROMPTS_PATH = output_dir / "judge_prompts.jsonl"
+    OUTPUTS_PATH = output_dir / "judge_outputs.jsonl"
+    MAPPED_PATH = output_dir / "mapped_results.csv"
+    METRICS_PATH = output_dir / "metrics_summary.csv"
+    REPORT_PATH = output_dir / "report.md"
+    FAILURES_PATH = output_dir / "parse_failures.jsonl"
 
 
-def choose_answer_version(cli_value: str | None, parser: argparse.ArgumentParser) -> str:
-    if cli_value is not None:
-        return cli_value
+def parse_answer_versions(value: str, parser: argparse.ArgumentParser) -> list[str]:
+    """Parse a comma/space separated version list while preserving its order."""
+    parts = [part.upper().removeprefix("V") for part in re.split(r"[,，\s]+", value.strip()) if part]
+    if not parts or any(part not in {"1", "2", "3", "4"} for part in parts):
+        parser.error("--answer-versions 必须是 1、2、3、4 的组合，例如 2,3,4")
+    return list(dict.fromkeys(parts))
+
+
+def choose_experiment_plan(args: argparse.Namespace,
+                           parser: argparse.ArgumentParser) -> tuple[list[str], int, bool]:
+    """Return selected versions, repeat count, and whether named run folders are used."""
+    if args.answer_version and args.answer_versions:
+        parser.error("--answer-version 和 --answer-versions 不能同时使用")
+    if args.rounds is not None and args.rounds < 1:
+        parser.error("--rounds 必须大于或等于 1")
+
+    if args.answer_versions:
+        return parse_answer_versions(args.answer_versions, parser), args.rounds or 1, True
+    if args.answer_version:
+        # An explicitly supplied --rounds opts into the new VxRy folder layout;
+        # the old command without --rounds retains its original paths.
+        return [args.answer_version], args.rounds or 1, args.rounds is not None
     if not sys.stdin.isatty():
-        parser.error("非交互环境必须指定 --answer-version 1、2 或 3")
-    print("\n请选择本次测评使用的候选回答版本：")
-    print("  1 - V1：高质量回答与较弱回答差距较大（保留原实验和断点）")
-    print("  2 - V2：两者质量接近，较弱回答仅有次要遗漏或轻微格式冗余")
-    print("  3 - V3：长度偏见实验，弱回答为 V2 弱回答的注水扩写版（长度≥2倍）")
+        parser.error("非交互环境必须指定 --answer-version 或 --answer-versions")
+
+    print("\n请选择要运行的候选回答版本。")
+    print("可输入一个或多个版本，例如 2,3,4：")
     while True:
         try:
-            value = input("请输入 1、2 或 3：").strip()
+            raw_versions = input("版本：").strip()
         except EOFError:
-            parser.error("无法读取交互输入，请使用 --answer-version 指定版本")
-        if value in {"1", "2", "3"}:
-            return value
-        print("输入无效，请输入 1、2 或 3。")
+            parser.error("无法读取交互输入，请使用 --answer-versions 指定版本")
+        parts = [
+            part.upper().removeprefix("V")
+            for part in re.split(r"[,，\s]+", raw_versions)
+            if part
+        ]
+        if parts and all(part in {"1", "2", "3", "4"} for part in parts):
+            versions = list(dict.fromkeys(parts))
+            break
+        print("输入无效，请输入 1、2、3、4 的组合，例如 2,3,4。")
+    while True:
+        try:
+            raw_rounds = input("每个版本进行几轮实验：").strip()
+        except EOFError:
+            parser.error("无法读取交互输入，请使用 --rounds 指定轮数")
+        if raw_rounds.isdigit() and int(raw_rounds) >= 1:
+            return versions, int(raw_rounds), True
+        print("输入无效，请输入大于或等于 1 的整数。")
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -162,6 +219,63 @@ def _estimate_input_chars(prompt: str) -> int:
     return len(SYSTEM_PROMPT) + len(prompt)
 
 
+def _chat_completions_url(base_url: str) -> str:
+    """Accept either an API root (/v1) or a full chat-completions URL."""
+    url = base_url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    return url + "/chat/completions"
+
+
+def test_api_connection(timeout_seconds: float = DEFAULT_API_TEST_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Make one minimal request and verify the configured Judge API is usable."""
+    if not JUDGE_API_KEY or JUDGE_API_KEY == "PASTE_YOUR_JUDGE_API_KEY_HERE":
+        raise RuntimeError("JUDGE_API_KEY is not configured")
+
+    payload = {
+        "model": JUDGE_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": 'Reply exactly with {"ok":true}.'},
+        ],
+        "temperature": TEMPERATURE,
+        "seed": SEED,
+        "response_format": {"type": "json_object"},
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        _chat_completions_url(JUDGE_BASE_URL),
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {JUDGE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(500).decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason}{suffix}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"connection or response error: {exc}") from exc
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        result = json.loads(content)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("API responded, but did not return valid JSON message content") from exc
+    if result.get("ok") is not True:
+        raise RuntimeError(f"API responded, but the test content was unexpected: {content[:200]}")
+    return {
+        "model": data.get("model", JUDGE_MODEL_NAME),
+        "elapsed_seconds": time.monotonic() - started,
+    }
+
+
 def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any,
                       progress_queue: Any) -> None:
     """Isolated API process: it can be terminated without leaving an orphan request."""
@@ -169,7 +283,7 @@ def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any
         result_queue.put(("error",
                           "Set JUDGE_API_KEY at the top of this file, or run with --mock."))
         return
-    url = api_config["base_url"].rstrip("/") + "/chat/completions"
+    url = _chat_completions_url(api_config["base_url"])
     payload = {
         "model": api_config["model"],
         "messages": [
@@ -615,6 +729,7 @@ def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str)
     headers = ["experiment_condition", "consistency", "flip_rate", "accuracy",
                "strong_win_rate", "weak_win_rate", "tie_rate", "forced_tie_rate"]
     title = ("# LLM Judge 长度偏见实验报告" if answer_version == "3"
+             else "# LLM Judge 表层说服偏见实验报告" if answer_version == "4"
              else "# LLM Judge 位置偏见实验报告")
     lines = [title, "",
              f"> 运行模式：{'MOCK（仅验证流程，不可作为实验结论）' if mock else '真实 Judge API'}", "",
@@ -645,19 +760,48 @@ def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str)
             "说明 Judge 因冗长而高估弱回答，即存在长度偏见。",
             f"- Reason-then-Judge 的弱回答胜率为 {r_weak}。若该干预能把胜率压回 V2 水平，"
             "说明先推理后判决有助于抵抗长度偏见。",
-            "- 也可比较 V3 与 V2 的 Accuracy 差值；Accuracy 下降越多，长度偏见越严重。", ""]
+             "- 也可比较 V3 与 V2 的 Accuracy 差值；Accuracy 下降越多，长度偏见越严重。", ""]
+    if answer_version == "4":
+        b_weak = fmt(b["weak_win_rate"])
+        r_weak = fmt(r["weak_win_rate"])
+        lines += [
+            "## 表层说服偏见（V4 专用）", "",
+            "V4 完整保留 V2 弱回答原文，仅添加固定的权威、群体共识、常识化、精致标题与同情表达。"
+            "核心对照是 V4 与 V2 在同一 Judge 和同一条件下的弱回答胜率差：", "",
+            f"- 基线弱回答（表层增强版）胜率为 {b_weak}。若明显高于 V2 的基线弱回答胜率，"
+            "说明 Judge 可能被不增加实质内容的权威/共识/风格/同情线索误导。",
+            f"- Reason-then-Judge 的弱回答胜率为 {r_weak}。若该干预能把胜率压回 V2 水平，"
+            "说明显式比较内容质量可能有助于抵抗表层说服偏见。",
+            "- V4 将多种表层线索组合为一个处理条件，因此可检验总体效应，但不能仅凭本版本"
+            "把总体效应唯一归因于某一种线索；若需区分三类偏见，应进一步建立单因素消融版本。", ""]
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mock", action="store_true", help="Test the pipeline without API calls")
+    parser.add_argument(
+        "--test-api", action="store_true",
+        help="Test the configured Judge API and exit without running the experiment")
+    parser.add_argument(
+        "--skip-api-check", action="store_true",
+        help="Skip the automatic API availability check before a real experiment")
+    parser.add_argument(
+        "--api-test-timeout", type=float, default=DEFAULT_API_TEST_TIMEOUT_SECONDS,
+        help="Timeout in seconds for the startup API check (default: 15)")
     parser.add_argument("--limit", type=int, help="Run only the first N questions (smoke tests)")
     parser.add_argument("--fresh", action="store_true", help="Start new prompt/output/log files")
     parser.add_argument(
-        "--answer-version", choices=("1", "2", "3"),
+        "--answer-version", choices=("1", "2", "3", "4"),
         help="Candidate answer set: 1=larger quality gap, 2=close quality, "
-             "3=verbosity bias (weak answer padded to >=2x length)")
+             "3=verbosity bias (weak answer padded to >=2x length), "
+             "4=surface-persuasion bias (fixed authority/consensus/style/compassion cues)")
+    parser.add_argument(
+        "--answer-versions", metavar="LIST",
+        help="Run multiple answer sets, e.g. 2,3,4 (results use VxRy folders)")
+    parser.add_argument(
+        "--rounds", type=int,
+        help="Number of independent runs for every selected answer version")
     parser.add_argument(
         "--skip-question", action="append", default=[], metavar="ID[,ID]",
         help="Skip one or more complete questions, e.g. --skip-question 90,105")
@@ -669,8 +813,19 @@ def main() -> None:
         default=DEFAULT_FIRST_OUTPUT_TIMEOUT_SECONDS,
         help="Fail one judgment and continue if the API returns nothing within this many seconds; 0 disables")
     args = parser.parse_args()
-    answer_version = choose_answer_version(args.answer_version, parser)
-    configure_answer_version(answer_version)
+    if args.mock and args.test_api:
+        parser.error("--mock and --test-api cannot be used together")
+    if args.api_test_timeout <= 0:
+        parser.error("--api-test-timeout must be greater than zero")
+    if args.test_api:
+        print(f"Testing Judge API | model={JUDGE_MODEL_NAME} | endpoint={_chat_completions_url(JUDGE_BASE_URL)}")
+        try:
+            result = test_api_connection(args.api_test_timeout)
+        except RuntimeError as exc:
+            parser.exit(1, f"API test failed: {exc}\n")
+        print(f"API test passed | model={result['model']} | latency={result['elapsed_seconds']:.2f}s")
+        return
+    answer_versions, rounds, named_runs = choose_experiment_plan(args, parser)
     if args.limit is not None and not 1 <= args.limit <= 80:
         parser.error("--limit must be in [1, 80]")
     if args.max_call_seconds < 0:
@@ -684,24 +839,61 @@ def main() -> None:
         if item.strip()
     }
     questions = load_jsonl(QUESTIONS_PATH)
-    answers = load_jsonl(ANSWERS_PATH)
     truth = json.loads(GROUND_TRUTH_PATH.read_text(encoding="utf-8"))
-    validate_inputs(questions, answers, truth)
+    answers_by_version: dict[str, list[dict[str, Any]]] = {}
+    for answer_version in answer_versions:
+        answer_path = ROOT / f"answers_v{answer_version}.jsonl"
+        answers = load_jsonl(answer_path)
+        validate_inputs(questions, answers, truth)
+        answers_by_version[answer_version] = answers
     known_ids = {str(q["question_id"]) for q in questions}
     unknown_skip_ids = skip_question_ids - known_ids
     if unknown_skip_ids:
         parser.error(f"unknown --skip-question IDs: {sorted(unknown_skip_ids)}")
-    if args.fresh:
-        for path in (PROMPTS_PATH, OUTPUTS_PATH, FAILURES_PATH):
-            path.unlink(missing_ok=True)
-    random.seed(SEED)
-    run_judging(questions, answers, args.mock, args.limit, skip_question_ids,
-                args.max_call_seconds, args.first_output_timeout, answer_version)
-    mapped, metrics = calculate_results(questions, truth, args.limit, answer_version)
-    write_csv(MAPPED_PATH, mapped)
-    write_csv(METRICS_PATH, metrics)
-    write_report(metrics, args.mock, answer_version)
-    print(f"Done: {len(mapped)} complete questions. Report: {REPORT_PATH}")
+    if not args.mock and not args.skip_api_check:
+        print(f"Checking Judge API before experiment | model={JUDGE_MODEL_NAME}")
+        try:
+            result = test_api_connection(args.api_test_timeout)
+        except RuntimeError as exc:
+            parser.exit(
+                1,
+                f"API check failed; no experiment files were changed: {exc}\n"
+                "Fix the API configuration, run --test-api for diagnostics, or use "
+                "--skip-api-check to bypass this check.\n",
+            )
+        print(f"API check passed | model={result['model']} | latency={result['elapsed_seconds']:.2f}s")
+    total_runs = len(answer_versions) * rounds
+    print(
+        f"Experiment plan: versions={','.join('V' + v for v in answer_versions)} | "
+        f"rounds={rounds} | total runs={total_runs}"
+    )
+    run_index = 0
+    for answer_version in answer_versions:
+        for round_number in range(1, rounds + 1):
+            run_index += 1
+            run_name = f"V{answer_version}R{round_number}" if named_runs else None
+            configure_answer_version(answer_version, run_name)
+            display_name = run_name or f"V{answer_version} (legacy output paths)"
+            print(f"\n=== [{run_index}/{total_runs}] Starting {display_name} ===", flush=True)
+            if args.fresh:
+                for path in (PROMPTS_PATH, OUTPUTS_PATH, FAILURES_PATH):
+                    path.unlink(missing_ok=True)
+            random.seed(SEED)
+            run_judging(
+                questions, answers_by_version[answer_version], args.mock, args.limit,
+                skip_question_ids, args.max_call_seconds, args.first_output_timeout,
+                answer_version,
+            )
+            mapped, metrics = calculate_results(questions, truth, args.limit, answer_version)
+            write_csv(MAPPED_PATH, mapped)
+            write_csv(METRICS_PATH, metrics)
+            write_report(metrics, args.mock, answer_version)
+            print(
+                f"Completed {display_name}: {len(mapped)} complete questions. "
+                f"Report: {REPORT_PATH}",
+                flush=True,
+            )
+    print(f"\nDone: {total_runs} experiment run(s) completed.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+{"question_id": 83, "method": "reason", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "AttributeError(\"'list' object has no attribute 'get'\")", "answer_version": "4"}
+{"question_id": 91, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid winner: ''\")", "answer_version": "4"}
+{"question_id": 95, "method": "reason", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid final_winner: '-1'\")", "answer_version": "4"}
+{"question_id": 115, "method": "reason", "order": "forward", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "TimeoutError('no first API output before configured timeout')", "answer_version": "4"}
+{"question_id": 130, "method": "baseline", "order": "forward", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "ValueError(\"Invalid winner: ''\")", "answer_version": "4"}
+{"question_id": 146, "method": "baseline", "order": "reverse", "raw_output": "", "parsed_winner": null, "parse_ok": false, "is_mock": false, "error": "AttributeError(\"'list' object has no attribute 'get'\")", "answer_version": "4"}

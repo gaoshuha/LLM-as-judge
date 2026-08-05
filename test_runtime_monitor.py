@@ -43,6 +43,29 @@ class SlowHandler(StreamingHandler):
     initial_delay = 5.0
 
 
+class ApiTestHandler(BaseHTTPRequestHandler):
+    request_path = ""
+
+    def do_POST(self) -> None:
+        type(self).request_path = self.path
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        assert body["stream"] is False
+        assert body["response_format"] == {"type": "json_object"}
+        response = {
+            "model": body["model"],
+            "choices": [{"message": {"content": json.dumps({"ok": True})}}],
+        }
+        encoded = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *args) -> None:  # noqa: ANN002
+        pass
+
+
 def serve(handler: type[BaseHTTPRequestHandler]) -> QuietServer:
     server = QuietServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -53,6 +76,17 @@ def main() -> None:
     experiment.JUDGE_API_KEY = "local-test-key"
     experiment.MAX_RETRIES = 1
     experiment.STATUS_REFRESH_SECONDS = 0.05
+
+    api_test_server = serve(ApiTestHandler)
+    experiment.JUDGE_BASE_URL = f"http://127.0.0.1:{api_test_server.server_port}/v1"
+    api_test_result = experiment.test_api_connection(2)
+    assert api_test_result["model"] == experiment.JUDGE_MODEL_NAME
+    assert ApiTestHandler.request_path == "/v1/chat/completions"
+    experiment.JUDGE_BASE_URL += "/chat/completions"
+    experiment.test_api_connection(2)
+    assert ApiTestHandler.request_path == "/v1/chat/completions", "Full endpoint was duplicated"
+    api_test_server.shutdown()
+    api_test_server.server_close()
 
     normal = serve(StreamingHandler)
     experiment.JUDGE_BASE_URL = f"http://127.0.0.1:{normal.server_port}/v1"
@@ -95,7 +129,8 @@ def main() -> None:
     assert timeout_console.getvalue().count("API调用 |") == 1
     assert "[TIMEOUT]" in timeout_console.getvalue()
     assert not mp.active_children(), "First-output timeout left an API child process"
-    print("STREAM_OK; HARD_CANCEL_OK; FIRST_OUTPUT_TIMEOUT_OK; NO_ORPHAN_PROCESS; STATIC_ONE_LINE_OK")
+    print("API_TEST_OK; URL_NORMALIZATION_OK; STREAM_OK; HARD_CANCEL_OK; "
+          "FIRST_OUTPUT_TIMEOUT_OK; NO_ORPHAN_PROCESS; STATIC_ONE_LINE_OK")
 
 
 if __name__ == "__main__":
