@@ -8,29 +8,30 @@
 - `answers_v2.jsonl`：接近质量版本。`candidate_1` 与 V1 完全相同；`candidate_2` 从高质量回答做保守编辑，只删除非关键解释、示例、边界条件或增加轻微格式冗余，不主动引入错误。80 道题的两轮轨迹均至少有一处局部差异。
 - `answers_v3.jsonl`：长度偏见（Verbosity Bias）实验版本。`candidate_1` 与 V2 完全相同；`candidate_2` 是 V2 弱回答的“注水扩写版”——由 `build_answers_v3.py` 调用扩写模型一次性生成，内容（包括错误）保持不变，只做冗余扩写，每个 turn 的字符数至少是原回答的 2 倍。长度是 V3 相对 V2 唯一被操纵的变量。
 - `answers_v4.jsonl`：表层说服偏见实验版本。`candidate_1` 与 V2 完全相同；`candidate_2` 完整保留 V2 弱回答原文，只由 `build_answers_v4.py` 添加固定的权威、群体共识、常识化、精致标题和同情表达，不新增事实、论据或推理，也不修正错误和遗漏。
+- `answers_v5.jsonl`：自然表层线索实验版本。`candidate_1` 与 V2 完全相同；`candidate_2` 由 `build_answers_v5.py` 调用改写模型生成——权威/共情表述被**与内容耦合地织入正文**（如附着在具体论点上的“某领域专家通常建议……”、针对提问者实际处境的共情句），而非 V4 那种与内容无关的固定话术拼接；实质内容（含错误与遗漏）保持不变。V5 相对 V4 唯一操纵的变量是线索的**自然度**，用于检验自然度是否是表层线索生效的调节变量。
 
-`answers.jsonl` 保留为 V1 的兼容副本。四套候选都只构造一次，正式实验不会动态生成。
+`answers.jsonl` 保留为 V1 的兼容副本。五套候选都只构造一次，正式实验不会动态生成。
 
 Judge 每题执行四次盲评：Baseline 正序/逆序、Reason-then-Judge 正序/逆序。正序的 A/B 分别对应 candidate_1/candidate_2，逆序交换；发送内容只使用 `Response A`、`Response B`，不含真实映射。真实映射单独保存在 `ground_truth.json`，仅在 Judge 输出完成后用于离线统计。
 
 映射回原候选后，位置一致率为
 
-\[
+$$
 \mathrm{Consistency}=\frac{1}{N}\sum_{i=1}^{N}\mathbf{1}[\hat w_i^{f}=\hat w_i^{r}],
-\]
+$$
 
 翻转率为
 
-\[
+$$
 \mathrm{Flip\ Rate}=1-\mathrm{Consistency}.
-\]
+$$
 
 准确率按全部正逆序判决中选择高质量候选的比例计算：
 
-\[
+$$
 \mathrm{Accuracy}=\frac{1}{2N}\sum_{i=1}^{N}
 \left(\mathbf{1}[\hat w_i^{f}=\mathrm{strong}]+\mathbf{1}[\hat w_i^{r}=\mathrm{strong}]\right).
-\]
+$$
 
 这里使用加号。任务说明中的减号与“选中高质量回答的比例”这一定义矛盾，会使逆序的正确判决产生负贡献。
 
@@ -130,6 +131,15 @@ python .\build_answers_v4.py            # 生成 answers_v4.jsonl 与逐 turn �
 python .\position_bias_experiment.py --answer-version 4 --fresh
 ```
 
+实验 4（自然表层线索偏见，V5）先一次性调用改写模型生成内容耦合线索版候选，再运行 Judge：
+
+```powershell
+python .\build_answers_v5.py            # 生成 answers_v5.jsonl，可断点续跑
+python .\position_bias_experiment.py --answer-version 5 --fresh
+```
+
+多模型 Jury 评测（实验 5）需要先配置第二、第三 Judge 的 API，再加 `--jury` 运行，见第 9 节。
+
 省略版本参数时，交互式终端会在任何 Judge 请求开始前依次询问“运行哪些版本”和“每个版本运行几轮”。版本可输入单个值或逗号分隔的列表，例如：
 
 ```text
@@ -201,3 +211,54 @@ V4 的弱回答由一个固定前缀、V2 弱回答完整原文和一个固定�
 `v4_surface_cue_report.csv` 为全部 160 个 turn 记录原文与嵌入原文的 SHA-256、字符数、长度倍率和三项布尔校验。生成时只要 `candidate_1` 不能保持不变、V2 弱回答不能完整取回，或包装不符合固定模板，脚本就会失败。
 
 V4 的核心判据是与 V2 同条件比较：若 V4 弱回答胜率明显升高或 Accuracy 明显下降，说明 Judge 可能受不增加实质内容的表层说服线索影响。由于 V4 将权威、共识、常识化、风格和同情线索组合在同一处理条件中，它适合检验总体效应；若要分别归因于权威偏见、风格偏见或同情心衰减偏见，应另做仅保留单一线索的消融版本。
+
+## 8. 实验 4：自然表层线索偏见（V5）
+
+V5 的弱回答由改写模型把权威/共情表述织入 V2 弱回答正文：线索与内容耦合（提及本回答的主题、附着于已有论点、呼应提问者处境），且每次改写措辞不同，而非 V4 的固定前后缀。改写受硬约束：不新增/修正事实、数字逐一保留、代码块逐字节不变、长度不超过原文 1.6 倍（降低长度对 V5/V4 对照的混淆）。因此 V5 相对 V4 的判据是：
+
+- 若 V5 弱回答胜率明显高于 V4（V4 中 Judge 已能识破生硬话术，弱回答胜率为 0），说明自然度是表层线索生效的调节变量——线索越自然、越与内容耦合，越容易误导 Judge。
+- 若 V5 与 V4 的弱回答胜率无显著差异，说明表层线索的无效主要来自其不增加实质内容，而非表达生硬。
+- 若 Reason-then-Judge 能把 V5 的弱回答胜率压回 V2 水平，说明显式比较内容质量有助于抵抗自然化的表层说服线索。
+
+`build_answers_v5.py` 逐 turn 校验改写结果：数字丢失或长度超出 [1.02, 1.6] 倍窗口时会自动调整目标长度重试（每 turn 最多 4 次），每个 turn 的原始长度、改写长度、倍率和校验结果记录在 `v5_natural_cue_report.csv`。改写进度保存在 `answers_v5_progress.jsonl`，中断后重新运行自动续跑；`--fresh` 会丢弃进度重新生成；`--mock` 为不调 API 的管线测试模式。
+
+`report_v5.md`（或 `results/V5Rx/report.md`）会在通用指标之后附加“自然表层线索偏见（V5 专用）”一节，汇总基线与 Reason-then-Judge 条件下自然线索弱回答的胜率。
+
+## 9. 实验 5：多模型 Jury 投票
+
+动机：类别分层结果显示两个 Judge 的薄弱类别不重合——这是“模型互补性”的直接证据，因此用陪审投票换取翻转率和准确率上的收益。
+
+机制：加 `--jury` 后，每个条件判决（Baseline/RtJ × 正/逆序）由 Judge1 与 Judge2 **并行**评判同一匿名 prompt；两者结论一致时采用共同结论，**分歧时调用 Judge3 仲裁，以 Judge3 的结果为最终判决**。指标表（Consistency、Flip Rate、Accuracy 等）全部按 Jury 最终判决计算，与单模型实验完全同构；单模型判决只保留在 `judge_outputs` 中，不单独统计指标。
+
+配置（文件顶部常量，均可用同名命令行参数覆盖）：
+
+```python
+JUDGE2_API_KEY / JUDGE2_MODEL_NAME / JUDGE2_BASE_URL   # 或 --judge2-key/--judge2-model/--judge2-url
+JUDGE3_API_KEY / JUDGE3_MODEL_NAME / JUDGE3_BASE_URL   # 或 --judge3-key/--judge3-model/--judge3-url
+```
+
+每个 Judge 槽位（含主 Judge）都支持两种 API 协议，由对应的 `JUDGE*_API_STYLE` 常量或 `--judgeN-style` 参数选择：
+
+- `openai`：OpenAI Chat Completions 兼容协议（`/chat/completions`，Bearer 鉴权，JSON mode）。
+- `anthropic`：Anthropic Messages API（`/v1/messages`，`x-api-key` + `anthropic-version` 头，`system` 为顶层字段）。
+- `auto`（默认）：按 `BASE_URL` 中是否包含 `anthropic` 自动判断。
+
+例如把仲裁 Judge3 换成 Claude：
+
+```powershell
+python .\position_bias_experiment.py --answer-version 2 --jury --fresh `
+    --judge3-key sk-ant-... --judge3-model claude-sonnet-4-5 `
+    --judge3-url https://api.anthropic.com --judge3-style anthropic
+```
+
+运行：
+
+```powershell
+python .\position_bias_experiment.py --test-api --jury                 # 依次自检三个 Judge
+python .\position_bias_experiment.py --answer-version 2 --jury --fresh # 单版本
+python .\position_bias_experiment.py --answer-versions 2,5 --rounds 2 --jury --fresh
+```
+
+Jury 结果与单模型结果的断点互不混用：单版本（不带 `--rounds`）使用 `judge_outputs_v{N}_jury.jsonl`、`report_v{N}_jury.md` 等带 `_jury` 后缀的文件；多轮运行使用 `results/V{N}R{r}_jury/` 文件夹。正式运行前会自动依次检查全部三个 Judge 的 API 可用性。
+
+分歧记录：每次运行结束后生成 `jury_disagreements.csv`，只列出 Judge1/Judge2 产生分歧的条件判决——包含两个 Judge 各自的判决、Judge3 仲裁结果、最终映射（strong/weak/tie）与最终投票正确性（对照 ground truth）。`report.md` 的“多模型 Jury 投票”一节汇总判决一致率、分歧题目标号，以及分歧判决中 Jury 最终投票选择 strong 的比例。

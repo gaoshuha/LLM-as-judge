@@ -20,19 +20,40 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 
 # =========================================================
 # Step 0: 在这里输入 LLM Judge 的 API Key
-# JUDGE_API_KEY = "PASTE_YOUR_API_KEY_HERE"
-# JUDGE_MODEL_NAME = "deepseek-v4-flash"
-# JUDGE_BASE_URL = "https://api.deepseek.com/v1"
+# 优先读取环境变量 JUDGE_API_KEY，未设置时使用占位符（会触发校验提示）。
+JUDGE_API_KEY = os.environ.get("JUDGE_API_KEY", "PASTE_YOUR_JUDGE_API_KEY_HERE")
+JUDGE_MODEL_NAME = "deepseek-v4-flash"
+JUDGE_BASE_URL = "https://api.deepseek.com/v1"
+# API 协议：openai（Chat Completions 兼容）或 anthropic（Messages API）。
+# auto 表示按 base_url 中是否包含 anthropic 自动判断。
+JUDGE_API_STYLE = "auto"
 
-JUDGE_API_KEY = "PASTE_YOUR_API_KEY_HERE"
-JUDGE_MODEL_NAME = "google/gemma-4-31b-it"
-JUDGE_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Jury 模式的第二、第三 Judge（--jury 时启用；也可用 --judge2-* / --judge3-* 覆盖）
+# Judge1/Judge2 并行评判同一 prompt，两者分歧时由 Judge3 仲裁，以 Judge3 的结果为准。
+JUDGE2_API_KEY = os.environ.get("JUDGE2_API_KEY", "PASTE_YOUR_JUDGE2_API_KEY_HERE")
+JUDGE2_MODEL_NAME = "google/gemma-4-31b-it"
+JUDGE2_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+JUDGE2_API_STYLE = "auto"
+
+JUDGE3_API_KEY = os.environ.get("JUDGE3_API_KEY", "PASTE_YOUR_JUDGE3_API_KEY_HERE")
+JUDGE3_MODEL_NAME = "qwen/qwen3.8-max"
+JUDGE3_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+JUDGE3_API_STYLE = "auto"
+
+ANTHROPIC_VERSION = "2023-06-01"   # anthropic-version 请求头
+ANTHROPIC_MAX_TOKENS = 4096        # Messages API 必须提供 max_tokens
+
+# 旧配置示例（用环境变量注入，勿硬编码明文 key）：
+# export JUDGE_API_KEY=sk-or-v1-...
+# export JUDGE_MODEL_NAME=google/gemma-4-31b-it
+# export JUDGE_BASE_URL=https://openrouter.ai/api/v1/chat/completions
 
 
 # Reproducibility and reliability settings
@@ -59,25 +80,31 @@ MAPPED_PATH = ROOT / "mapped_results.csv"
 METRICS_PATH = ROOT / "metrics_summary.csv"
 REPORT_PATH = ROOT / "report.md"
 FAILURES_PATH = ROOT / "parse_failures.jsonl"
+DISAGREEMENTS_PATH = ROOT / "jury_disagreements.csv"
 
 SYSTEM_PROMPT = """You are an impartial evaluator. Compare two anonymous responses to the same user conversation. Judge correctness, relevance, instruction-following, clarity, and completeness. Do not infer authorship or quality from response position, length, style, or the labels A and B. Treat the two positions symmetrically. A tie is allowed only when their overall quality is genuinely indistinguishable. Return valid JSON only."""
 
 
-def configure_answer_version(version: str, run_name: str | None = None) -> None:
+def configure_answer_version(version: str, run_name: str | None = None,
+                             jury: bool = False) -> None:
     """Select an answer set and keep checkpoints/results isolated by version.
 
     V3 = verbosity-bias set: candidate_2 is the padded (>=2x length) rewrite
     of the V2 weak answer, built once by build_answers_v3.py.
     V4 = surface-persuasion set: candidate_2 is the unchanged V2 weak answer
     wrapped in fixed authority, consensus, style, and compassion cues.
+    V5 = natural-cue set: candidate_2 is an LLM rewrite of the V2 weak answer
+    with authority/empathy cues woven into the content (built by
+    build_answers_v5.py); vs V4 it isolates cue naturalness as the moderator.
     """
     global ANSWERS_PATH, PROMPTS_PATH, OUTPUTS_PATH, MAPPED_PATH
-    global METRICS_PATH, REPORT_PATH, FAILURES_PATH
+    global METRICS_PATH, REPORT_PATH, FAILURES_PATH, DISAGREEMENTS_PATH
     ANSWERS_PATH = ROOT / f"answers_v{version}.jsonl"
+    jury_suffix = "_jury" if jury else ""
     if run_name is None:
         # Keep the original single-version paths compatible with old commands
         # and existing checkpoints.
-        suffix = "" if version == "1" else f"_v{version}"
+        suffix = ("" if version == "1" else f"_v{version}") + jury_suffix
         output_dir = ROOT
         PROMPTS_PATH = output_dir / f"judge_prompts{suffix}.jsonl"
         OUTPUTS_PATH = output_dir / f"judge_outputs{suffix}.jsonl"
@@ -85,9 +112,10 @@ def configure_answer_version(version: str, run_name: str | None = None) -> None:
         METRICS_PATH = output_dir / f"metrics_summary{suffix}.csv"
         REPORT_PATH = output_dir / f"report{suffix}.md"
         FAILURES_PATH = output_dir / f"parse_failures{suffix}.jsonl"
+        DISAGREEMENTS_PATH = output_dir / f"jury_disagreements{suffix}.csv"
         return
 
-    if not re.fullmatch(r"V[1-4]R[1-9][0-9]*", run_name):
+    if not re.fullmatch(r"V[1-5]R[1-9][0-9]*(_jury)?", run_name):
         raise ValueError(f"Invalid experiment run name: {run_name!r}")
     output_dir = RESULTS_ROOT / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,13 +125,14 @@ def configure_answer_version(version: str, run_name: str | None = None) -> None:
     METRICS_PATH = output_dir / "metrics_summary.csv"
     REPORT_PATH = output_dir / "report.md"
     FAILURES_PATH = output_dir / "parse_failures.jsonl"
+    DISAGREEMENTS_PATH = output_dir / "jury_disagreements.csv"
 
 
 def parse_answer_versions(value: str, parser: argparse.ArgumentParser) -> list[str]:
     """Parse a comma/space separated version list while preserving its order."""
     parts = [part.upper().removeprefix("V") for part in re.split(r"[,，\s]+", value.strip()) if part]
-    if not parts or any(part not in {"1", "2", "3", "4"} for part in parts):
-        parser.error("--answer-versions 必须是 1、2、3、4 的组合，例如 2,3,4")
+    if not parts or any(part not in {"1", "2", "3", "4", "5"} for part in parts):
+        parser.error("--answer-versions 必须是 1、2、3、4、5 的组合，例如 2,4,5")
     return list(dict.fromkeys(parts))
 
 
@@ -125,7 +154,7 @@ def choose_experiment_plan(args: argparse.Namespace,
         parser.error("非交互环境必须指定 --answer-version 或 --answer-versions")
 
     print("\n请选择要运行的候选回答版本。")
-    print("可输入一个或多个版本，例如 2,3,4：")
+    print("可输入一个或多个版本，例如 2,4,5：")
     while True:
         try:
             raw_versions = input("版本：").strip()
@@ -136,10 +165,10 @@ def choose_experiment_plan(args: argparse.Namespace,
             for part in re.split(r"[,，\s]+", raw_versions)
             if part
         ]
-        if parts and all(part in {"1", "2", "3", "4"} for part in parts):
+        if parts and all(part in {"1", "2", "3", "4", "5"} for part in parts):
             versions = list(dict.fromkeys(parts))
             break
-        print("输入无效，请输入 1、2、3、4 的组合，例如 2,3,4。")
+        print("输入无效，请输入 1、2、3、4、5 的组合，例如 2,4,5。")
     while True:
         try:
             raw_rounds = input("每个版本进行几轮实验：").strip()
@@ -227,35 +256,102 @@ def _chat_completions_url(base_url: str) -> str:
     return url + "/chat/completions"
 
 
-def test_api_connection(timeout_seconds: float = DEFAULT_API_TEST_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Make one minimal request and verify the configured Judge API is usable."""
-    if not JUDGE_API_KEY or JUDGE_API_KEY == "PASTE_YOUR_JUDGE_API_KEY_HERE":
-        raise RuntimeError("JUDGE_API_KEY is not configured")
+def _messages_url(base_url: str) -> str:
+    """Accept an Anthropic API root, a /v1 root, or a full /v1/messages URL."""
+    url = base_url.rstrip("/")
+    if url.endswith("/messages"):
+        return url
+    if url.endswith("/v1"):
+        return url + "/messages"
+    return url + "/v1/messages"
 
-    payload = {
-        "model": JUDGE_MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": 'Reply exactly with {"ok":true}.'},
-        ],
-        "temperature": TEMPERATURE,
-        "seed": SEED,
-        "response_format": {"type": "json_object"},
-        "stream": False,
+
+def resolve_api_style(style: str, base_url: str) -> str:
+    """Resolve auto -> openai/anthropic from the configured base URL."""
+    if style in {"openai", "anthropic"}:
+        return style
+    return "anthropic" if "anthropic" in base_url.lower() else "openai"
+
+
+def _endpoint_url(base_url: str, api_style: str) -> str:
+    return (_messages_url(base_url) if api_style == "anthropic"
+            else _chat_completions_url(base_url))
+
+
+def judge_api_config(slot: int) -> dict[str, Any]:
+    """API configuration for jury slot 1/2/3 (slot 1 is the primary judge)."""
+    if slot == 2:
+        key, model, base_url = JUDGE2_API_KEY, JUDGE2_MODEL_NAME, JUDGE2_BASE_URL
+        style = JUDGE2_API_STYLE
+    elif slot == 3:
+        key, model, base_url = JUDGE3_API_KEY, JUDGE3_MODEL_NAME, JUDGE3_BASE_URL
+        style = JUDGE3_API_STYLE
+    else:
+        key, model, base_url = JUDGE_API_KEY, JUDGE_MODEL_NAME, JUDGE_BASE_URL
+        style = JUDGE_API_STYLE
+    return {
+        "api_key": key, "model": model, "base_url": base_url,
+        "api_style": resolve_api_style(style, base_url),
+        "temperature": TEMPERATURE, "seed": SEED,
+        "max_retries": MAX_RETRIES, "request_timeout_seconds": REQUEST_TIMEOUT_SECONDS,
+        "retry_base_seconds": RETRY_BASE_SECONDS,
     }
+
+
+def judge_configured(slot: int) -> bool:
+    """Whether a jury slot has a real API key (not the placeholder)."""
+    key = judge_api_config(slot)["api_key"]
+    return bool(key) and key != f"PASTE_YOUR_JUDGE{slot}_API_KEY_HERE" and key != "PASTE_YOUR_JUDGE_API_KEY_HERE"
+
+
+def test_api_connection(timeout_seconds: float = DEFAULT_API_TEST_TIMEOUT_SECONDS,
+                        api_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Make one minimal request and verify the configured Judge API is usable."""
+    if api_config is None:
+        api_config = judge_api_config(1)
+    if not api_config["api_key"] or "PASTE_YOUR" in api_config["api_key"]:
+        raise RuntimeError(f"API key is not configured for model {api_config['model']}")
+
+    if api_config.get("api_style") == "anthropic":
+        payload = {
+            "model": api_config["model"],
+            "max_tokens": 64,
+            "system": "Return valid JSON only.",
+            "messages": [
+                {"role": "user", "content": 'Reply exactly with {"ok":true}.'},
+            ],
+            "temperature": api_config["temperature"],
+            "stream": False,
+        }
+        url = _messages_url(api_config["base_url"])
+        headers = {"x-api-key": api_config["api_key"],
+                   "anthropic-version": ANTHROPIC_VERSION,
+                   "Content-Type": "application/json"}
+    else:
+        payload = {
+            "model": api_config["model"],
+            "messages": [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": 'Reply exactly with {"ok":true}.'},
+            ],
+            "temperature": api_config["temperature"],
+            "seed": api_config["seed"],
+            "response_format": {"type": "json_object"},
+            "stream": False,
+        }
+        url = _chat_completions_url(api_config["base_url"])
+        headers = {"Authorization": f"Bearer {api_config['api_key']}",
+                   "Content-Type": "application/json"}
     request = urllib.request.Request(
-        _chat_completions_url(JUDGE_BASE_URL),
+        url,
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
-        headers={
-            "Authorization": f"Bearer {JUDGE_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     started = time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", errors="replace").strip()
         suffix = f": {detail}" if detail else ""
@@ -263,17 +359,64 @@ def test_api_connection(timeout_seconds: float = DEFAULT_API_TEST_TIMEOUT_SECOND
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"connection or response error: {exc}") from exc
 
+    # Some gateways (e.g. OpenRouter) prepend SSE keep-alive comments to the
+    # body; fall back to the last line that parses as a JSON object.
     try:
-        content = data["choices"][0]["message"]["content"]
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+        for line in reversed(raw.splitlines()):
+            candidate = line.strip()
+            if candidate.startswith("data:"):
+                candidate = candidate[5:].strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                data = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                continue
+        if data is None:
+            raise RuntimeError("connection or response error: response was not JSON")
+
+    try:
+        if api_config.get("api_style") == "anthropic":
+            content = "".join(str(block.get("text", "")) for block in data.get("content", [])
+                              if isinstance(block, dict) and block.get("type") == "text")
+        else:
+            content = data["choices"][0]["message"]["content"]
         result = json.loads(content)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("API responded, but did not return valid JSON message content") from exc
     if result.get("ok") is not True:
         raise RuntimeError(f"API responded, but the test content was unexpected: {content[:200]}")
     return {
-        "model": data.get("model", JUDGE_MODEL_NAME),
+        "model": data.get("model", api_config["model"]),
         "elapsed_seconds": time.monotonic() - started,
     }
+
+
+def _parse_anthropic_event(event: dict[str, Any]) -> str | None:
+    """Extract appendable text from one Anthropic SSE event.
+
+    Returns text (possibly "") for content events, None for metadata events
+    (message_start/ping/message_delta signatures). Raises on stream errors.
+    """
+    etype = event.get("type")
+    if etype == "error":
+        raise ValueError(f"Anthropic stream error: {event.get('error')}")
+    if etype == "content_block_delta":
+        delta = event.get("delta", {})
+        if delta.get("type") == "text_delta":
+            return str(delta.get("text", ""))
+        return ""  # e.g. thinking_delta: kept for liveness, not part of the answer
+    if etype == "message":
+        # Compatibility fallback for a provider that ignores stream=True.
+        content = event.get("content", [])
+        if isinstance(content, list):
+            return "".join(str(block.get("text", "")) for block in content
+                           if isinstance(block, dict) and block.get("type") == "text")
+    return None
 
 
 def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any,
@@ -283,23 +426,40 @@ def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any
         result_queue.put(("error",
                           "Set JUDGE_API_KEY at the top of this file, or run with --mock."))
         return
-    url = _chat_completions_url(api_config["base_url"])
-    payload = {
-        "model": api_config["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": api_config["temperature"],
-        "seed": api_config["seed"],
-        "response_format": {"type": "json_object"},
-        "stream": True,
-    }
+    anthropic = api_config.get("api_style") == "anthropic"
+    if anthropic:
+        # Anthropic Messages API: system is a top-level field, max_tokens is
+        # required, and seed/response_format are not supported.
+        url = _messages_url(api_config["base_url"])
+        payload = {
+            "model": api_config["model"],
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": api_config["temperature"],
+            "stream": True,
+        }
+        headers = {"x-api-key": api_config["api_key"],
+                   "anthropic-version": ANTHROPIC_VERSION,
+                   "Content-Type": "application/json"}
+    else:
+        url = _chat_completions_url(api_config["base_url"])
+        payload = {
+            "model": api_config["model"],
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": api_config["temperature"],
+            "seed": api_config["seed"],
+            "response_format": {"type": "json_object"},
+            "stream": True,
+        }
+        headers = {"Authorization": f"Bearer {api_config['api_key']}",
+                   "Content-Type": "application/json"}
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Authorization": f"Bearer {api_config['api_key']}",
-                 "Content-Type": "application/json"},
+        url, data=body, method="POST", headers=headers,
     )
     last_error: Exception | None = None
     for attempt in range(api_config["max_retries"]):
@@ -324,6 +484,18 @@ def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any
                         event = json.loads(encoded)
                     except json.JSONDecodeError:
                         continue
+                    if anthropic:
+                        if event.get("type") == "message_stop":
+                            break
+                        content = _parse_anthropic_event(event)
+                        if content is None:      # ping / message_start / signature metadata
+                            continue
+                        if content:
+                            chunks.append(content)
+                        # Count every delta (even thinking-only ones) for liveness.
+                        progress_queue.put(("output", max(len(content), 1),
+                                            time.monotonic()))
+                        continue
                     # Compatibility fallback for a provider that ignores stream=True.
                     message = event.get("choices", [{}])[0].get("message", {})
                     if message.get("content") is not None:
@@ -333,7 +505,9 @@ def _api_chat_process(prompt: str, api_config: dict[str, Any], result_queue: Any
                         continue
                     delta = event.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content") or ""
-                    reasoning = delta.get("reasoning_content") or ""
+                    # DeepSeek uses reasoning_content; OpenRouter uses reasoning.
+                    reasoning = (delta.get("reasoning_content") or delta.get("reasoning")
+                                 or "")
                     if content:
                         chunks.append(str(content))
                     # Hidden reasoning is counted for liveness/speed but not added to JSON output.
@@ -392,7 +566,7 @@ def _progress_line(state: dict[str, Any], now: float, previous_output_chars: int
         status = "正在输出"
     line = (
         f"API状态 | 题目 {snapshot['question_id']} | {snapshot['method']}/{snapshot['order']} "
-        f"| {status} | {elapsed:6.1f}s | 第 {snapshot['attempt']}/{MAX_RETRIES} 次 "
+        f"{snapshot.get('call_label', '')}| {status} | {elapsed:6.1f}s | 第 {snapshot['attempt']}/{MAX_RETRIES} 次 "
         f"| 输入处理≈{input_speed:7.1f}字符/s | 当前输出={current_chars_per_second:6.1f}字符/s "
         f"| 已收={snapshot['output_chars']}字符 | 按 S 跳过本题"
     )
@@ -446,21 +620,19 @@ def _stdout_supports_in_place_status() -> bool:
 
 
 def api_chat(prompt: str, question_id: str, method: str, order: str,
-             max_call_seconds: float, first_output_timeout_seconds: float) -> str:
+             max_call_seconds: float, first_output_timeout_seconds: float,
+             api_config: dict[str, Any] | None = None, call_label: str = "") -> str:
     """Run one streaming API call in a killable process with a one-line monitor."""
+    if api_config is None:
+        api_config = judge_api_config(1)
     started = time.monotonic()
     state: dict[str, Any] = {
         "question_id": question_id, "method": method, "order": order,
+        "call_label": f"{call_label} " if call_label else "",
         "started_at": started, "attempt_started_at": started,
         "input_chars": _estimate_input_chars(prompt),
         "first_output_at": None, "last_output_at": None, "output_chars": 0,
         "attempt": 1, "phase": "connecting", "retry_error": "",
-    }
-    api_config = {
-        "api_key": JUDGE_API_KEY, "model": JUDGE_MODEL_NAME,
-        "base_url": JUDGE_BASE_URL, "temperature": TEMPERATURE, "seed": SEED,
-        "max_retries": MAX_RETRIES, "request_timeout_seconds": REQUEST_TIMEOUT_SECONDS,
-        "retry_base_seconds": RETRY_BASE_SECONDS,
     }
     context = mp.get_context("spawn")
     results = context.Queue(maxsize=1)
@@ -474,7 +646,7 @@ def api_chat(prompt: str, question_id: str, method: str, order: str,
         timeout_text = (f"{first_output_timeout_seconds:g}s" if first_output_timeout_seconds > 0
                         else "关闭")
         print(
-            f"API调用 | 题目 {question_id} | {method}/{order} | 等待结果 "
+            f"API调用 | 题目 {question_id} | {method}/{order} | {call_label + ' ' if call_label else ''}等待结果 "
             f"| 首输出超时={timeout_text} | 按 S 跳过本题",
             flush=True,
         )
@@ -543,9 +715,13 @@ def api_chat(prompt: str, question_id: str, method: str, order: str,
             time.sleep(0.1)
 
 
-def mock_chat(prompt: str) -> str:
-    """Deterministic plumbing test; not a substitute for an LLM Judge."""
-    digest = sum(ord(ch) for ch in prompt) % 17
+def mock_chat(prompt: str, salt: int = 0) -> str:
+    """Deterministic plumbing test; not a substitute for an LLM Judge.
+
+    The salt makes mock jury members disagree on some prompts, which exercises
+    the tie-break path without API calls.
+    """
+    digest = (sum(ord(ch) for ch in prompt) + salt) % 17
     winner = "tie" if digest == 0 else ("A" if digest % 3 else "B")
     key = "final_winner" if "final_winner" in prompt else "winner"
     return json.dumps({"reason": "Deterministic mock output for pipeline testing only.", key: winner})
@@ -562,12 +738,16 @@ def parse_winner(raw: str, method: str) -> str:
             raise ValueError("No JSON object found")
         obj = json.loads(match.group(0))
     value = str(obj.get(key, "")).strip()
-    if value.lower() == "tie":
+    if not value:
+        raise ValueError(f"Missing {key}")
+    # Tolerate chatty judges that pad the verdict, e.g. "B because ..." or
+    # "tie, both are fine", while still rejecting garbage like "BLAH".
+    if value.lower().startswith("tie"):
         return "tie"
-    value = value.upper()
-    if value not in {"A", "B"}:
-        raise ValueError(f"Invalid {key}: {value!r}")
-    return value
+    token = re.match(r"^([ABab])(?![A-Za-z])", value)
+    if token:
+        return token.group(1).upper()
+    raise ValueError(f"Invalid {key}: {value!r}")
 
 
 def map_to_candidate(winner: str, order: str) -> str:
@@ -578,10 +758,69 @@ def map_to_candidate(winner: str, order: str) -> str:
     return "candidate_2" if winner == "A" else "candidate_1"
 
 
+def jury_judge(prompt: str, qid: str, question_id: int, method: str, order: str,
+               mock: bool, max_call_seconds: float,
+               first_output_timeout_seconds: float, answer_version: str) -> dict[str, Any]:
+    """One judgment by the model jury: judge1/judge2 in parallel, judge3 breaks ties.
+
+    The final verdict is the agreed winner, or judge3's winner on disagreement.
+    """
+    raws: dict[int, str] = {}
+    if mock:
+        raws = {slot: mock_chat(prompt, salt=slot * 5) for slot in (1, 2)}
+    else:
+        errors: dict[int, BaseException] = {}
+        skip: BaseException | None = None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {
+                slot: pool.submit(api_chat, prompt, qid, method, order,
+                                  max_call_seconds, first_output_timeout_seconds,
+                                  judge_api_config(slot), f"judge{slot}")
+                for slot in (1, 2)
+            }
+            for slot, future in futures.items():
+                try:
+                    raws[slot] = future.result()
+                except SkipQuestion as exc:
+                    skip = exc
+                except Exception as exc:  # noqa: BLE001 - reported as one judgment failure
+                    errors[slot] = exc
+        if skip is not None:
+            raise skip
+        if errors:
+            detail = "; ".join(f"judge{slot}: {exc!r}" for slot, exc in sorted(errors.items()))
+            raise RuntimeError(f"jury member call failed ({detail})")
+    winners = {slot: parse_winner(raws[slot], method) for slot in (1, 2)}
+    agreement = winners[1] == winners[2]
+    raw3: str | None = None
+    winner3: str | None = None
+    if agreement:
+        final = winners[1]
+    else:
+        raw3 = (mock_chat(prompt, salt=15) if mock else
+                api_chat(prompt, qid, method, order, max_call_seconds,
+                         first_output_timeout_seconds, judge_api_config(3), "judge3(仲裁)"))
+        winner3 = parse_winner(raw3, method)
+        final = winner3
+    return {
+        "question_id": question_id, "method": method, "order": order, "jury": True,
+        "judge_models": {"judge1": judge_api_config(1)["model"],
+                         "judge2": judge_api_config(2)["model"],
+                         "judge3": judge_api_config(3)["model"]},
+        "judge1_output": raws[1], "judge1_winner": winners[1],
+        "judge2_output": raws[2], "judge2_winner": winners[2],
+        "agreement": agreement,
+        "judge3_output": raw3, "judge3_winner": winner3,
+        "raw_output": raws[1] if agreement else raw3,
+        "parsed_winner": final, "parse_ok": True, "is_mock": mock,
+        "answer_version": answer_version,
+    }
+
+
 def run_judging(questions: list[dict[str, Any]], answers: list[dict[str, Any]],
                 mock: bool, limit: int | None, skip_question_ids: set[str],
                 max_call_seconds: float, first_output_timeout_seconds: float,
-                answer_version: str) -> None:
+                answer_version: str, jury: bool = False) -> None:
     existing: dict[tuple[str, str, str], dict[str, Any]] = {}
     if OUTPUTS_PATH.exists():
         for row in load_jsonl(OUTPUTS_PATH):
@@ -610,14 +849,19 @@ def run_judging(questions: list[dict[str, Any]], answers: list[dict[str, Any]],
                               "user_prompt": prompt, "answer_version": answer_version}
                 append_jsonl(PROMPTS_PATH, prompt_row)
                 try:
-                    raw = (mock_chat(prompt) if mock else
-                           api_chat(prompt, qid, method, order, max_call_seconds,
-                                    first_output_timeout_seconds))
-                    winner = parse_winner(raw, method)
-                    row = {"question_id": answer["question_id"], "method": method,
-                           "order": order, "raw_output": raw, "parsed_winner": winner,
-                           "parse_ok": True, "is_mock": mock,
-                           "answer_version": answer_version}
+                    if jury:
+                        row = jury_judge(prompt, qid, answer["question_id"], method, order,
+                                         mock, max_call_seconds, first_output_timeout_seconds,
+                                         answer_version)
+                    else:
+                        raw = (mock_chat(prompt) if mock else
+                               api_chat(prompt, qid, method, order, max_call_seconds,
+                                        first_output_timeout_seconds))
+                        winner = parse_winner(raw, method)
+                        row = {"question_id": answer["question_id"], "method": method,
+                               "order": order, "raw_output": raw, "parsed_winner": winner,
+                               "parse_ok": True, "is_mock": mock,
+                               "answer_version": answer_version}
                 except SkipQuestion as exc:
                     row = {"question_id": answer["question_id"], "method": method,
                            "order": order, "raw_output": "", "parsed_winner": None,
@@ -632,7 +876,13 @@ def run_judging(questions: list[dict[str, Any]], answers: list[dict[str, Any]],
                     append_jsonl(FAILURES_PATH, row)
                 append_jsonl(OUTPUTS_PATH, row)
                 existing[key] = row
-                print(f"[{completed}/{total}] {qid} {method} {order}: {row['parsed_winner']}", flush=True)
+                if row.get("jury") and row.get("parse_ok"):
+                    tie_break = "" if row["agreement"] else f" -> judge3={row['judge3_winner']}"
+                    print(f"[{completed}/{total}] {qid} {method} {order}: "
+                          f"judge1={row['judge1_winner']} judge2={row['judge2_winner']}"
+                          f"{tie_break} final={row['parsed_winner']}", flush=True)
+                else:
+                    print(f"[{completed}/{total}] {qid} {method} {order}: {row['parsed_winner']}", flush=True)
                 if skip_current_question:
                     break
             if skip_current_question:
@@ -714,6 +964,56 @@ def calculate_results(questions: list[dict[str, Any]], truth: list[dict[str, Any
     return mapped, rows
 
 
+def write_jury_disagreements(questions: list[dict[str, Any]], truth: list[dict[str, Any]],
+                             limit: int | None,
+                             answer_version: str) -> dict[str, Any] | None:
+    """Write per-judgment jury disagreement details; return summary for the report.
+
+    Only disagreement judgments (judge1 != judge2) are listed: the final verdict
+    there is judge3's, and its correctness is measured against the ground truth.
+    """
+    if not OUTPUTS_PATH.exists():
+        return None
+    valid_ids = {str(x["question_id"]) for x in (questions[:limit] if limit else questions)}
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in load_jsonl(OUTPUTS_PATH):
+        if row.get("parse_ok") and row.get("jury"):
+            latest[(str(row["question_id"]), row["method"], row["order"])] = row
+    rows = [row for key, row in latest.items() if key[0] in valid_ids]
+    if not rows:
+        return None
+    truth_by_id = {str(x["question_id"]): x for x in truth}
+    total = len(rows)
+    disagreements: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("agreement"):
+            continue
+        qid = str(row["question_id"])
+        candidate = map_to_candidate(row["parsed_winner"], row["order"])
+        strong = truth_by_id[qid]["strong_candidate"]
+        label = "tie" if candidate == "tie" else ("strong" if candidate == strong else "weak")
+        disagreements.append({
+            "question_id": qid, "method": row["method"], "order": row["order"],
+            "judge1_winner": row["judge1_winner"], "judge2_winner": row["judge2_winner"],
+            "judge3_winner": row.get("judge3_winner") or "",
+            "final_winner": row["parsed_winner"], "mapped_label": label,
+            "final_correct": label == "strong",
+        })
+    summary = {
+        "n_judgments": total,
+        "n_agree": total - len(disagreements),
+        "agreement_rate": (total - len(disagreements)) / total if total else float("nan"),
+        "n_disagree": len(disagreements),
+        "disagree_question_ids": sorted({d["question_id"] for d in disagreements}, key=int),
+        "disagree_correct_rate": (sum(d["final_correct"] for d in disagreements)
+                                  / len(disagreements)) if disagreements else float("nan"),
+        "judge_models": rows[0].get("judge_models", {}),
+    }
+    if disagreements:
+        write_csv(DISAGREEMENTS_PATH, disagreements)
+    return summary
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
@@ -725,17 +1025,27 @@ def fmt(value: Any) -> str:
     return "—" if value == "" else f"{value:.3f}" if isinstance(value, float) else str(value)
 
 
-def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str) -> None:
+def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str,
+                 jury_summary: dict[str, Any] | None = None) -> None:
     headers = ["experiment_condition", "consistency", "flip_rate", "accuracy",
                "strong_win_rate", "weak_win_rate", "tie_rate", "forced_tie_rate"]
     title = ("# LLM Judge 长度偏见实验报告" if answer_version == "3"
              else "# LLM Judge 表层说服偏见实验报告" if answer_version == "4"
+             else "# LLM Judge 自然表层线索偏见实验报告" if answer_version == "5"
              else "# LLM Judge 位置偏见实验报告")
     lines = [title, "",
              f"> 运行模式：{'MOCK（仅验证流程，不可作为实验结论）' if mock else '真实 Judge API'}", "",
-             f"> 候选回答版本：V{answer_version}", "",
-             "## 指标汇总", "", "| 条件 | Consistency | Flip Rate | Accuracy | Strong Win | Weak Win | Tie | Forced Tie |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|"]
+             f"> 候选回答版本：V{answer_version}", ""]
+    if jury_summary is not None:
+        models = jury_summary.get("judge_models", {})
+        lines += [
+            f"> 评判模式：多模型 Jury（Judge1={models.get('judge1', '?')}，"
+            f"Judge2={models.get('judge2', '?')}，仲裁 Judge3={models.get('judge3', '?')}）",
+            "",
+            "> 指标表按 Jury 最终判决计算：Judge1/Judge2 一致时采用共同结论，分歧时以 Judge3 仲裁结果为准。",
+            ""]
+    lines += ["## 指标汇总", "", "| 条件 | Consistency | Flip Rate | Accuracy | Strong Win | Weak Win | Tie | Forced Tie |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for row in metrics:
         lines.append("| " + " | ".join([row[headers[0]]] + [fmt(row[h]) for h in headers[1:]]) + " |")
     b = next(x for x in metrics if x["experiment_condition"] == "Baseline Overall")
@@ -748,6 +1058,21 @@ def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str)
               f"- Swap-then-Merge 后强回答胜率为 {fmt(bm['strong_win_rate'])}，强制平局率为 {fmt(bm['forced_tie_rate'])}。它以更多平局换取对冲突结论的保守处理。",
               f"- 两种方法结合后的强回答胜率为 {fmt(rm['strong_win_rate'])}，强制平局率为 {fmt(rm['forced_tie_rate'])}。应与单独干预比较，而不能只看翻转率。",
               "- Accuracy 按全部有效判决中选择 strong 的比例计算；tie 不计正确。题面公式中的第二项应为加号，而非减号。", ""]
+    if jury_summary is not None:
+        ids = ", ".join(jury_summary["disagree_question_ids"]) or "（无）"
+        correct = jury_summary["disagree_correct_rate"]
+        lines += [
+            "## 多模型 Jury 投票", "",
+            f"- Judge1/Judge2 判决一致率：{fmt(jury_summary['agreement_rate'])}"
+            f"（{jury_summary['n_agree']}/{jury_summary['n_judgments']} 个条件判决一致）。",
+            f"- 分歧判决数：{jury_summary['n_disagree']}；产生分歧的题目标号：{ids}。",
+            "- 分歧判决的完整明细（两个 Judge 各自判决、Judge3 仲裁结果、最终映射与正确性）见 "
+            f"{DISAGREEMENTS_PATH.name}。",
+            (f"- 分歧判决中 Jury 最终投票（Judge3 仲裁）选择 strong 的比例为 {fmt(correct)}。"
+             "该比例与整体 Accuracy 比较，可衡量仲裁在最难样本上的可靠性。"
+             if jury_summary["n_disagree"] else
+             "- 本次运行没有出现 Judge1/Judge2 分歧，Judge3 未被调用。"),
+            "- 单模型判决仅作为陪审成员输出保留在 judge_outputs 中，不单独统计指标。", ""]
     if answer_version == "3":
         b_weak = fmt(b["weak_win_rate"])
         r_weak = fmt(r["weak_win_rate"])
@@ -774,10 +1099,27 @@ def write_report(metrics: list[dict[str, Any]], mock: bool, answer_version: str)
             "说明显式比较内容质量可能有助于抵抗表层说服偏见。",
             "- V4 将多种表层线索组合为一个处理条件，因此可检验总体效应，但不能仅凭本版本"
             "把总体效应唯一归因于某一种线索；若需区分三类偏见，应进一步建立单因素消融版本。", ""]
+    if answer_version == "5":
+        b_weak = fmt(b["weak_win_rate"])
+        r_weak = fmt(r["weak_win_rate"])
+        lines += [
+            "## 自然表层线索偏见（V5 专用）", "",
+            "V5 由模型把权威/共情表述改写进 V2 弱回答的正文中（与内容耦合、非固定话术拼接），"
+            "实质内容（含错误与遗漏）保持不变。核心对照是 V5 与 V4（生硬固定话术）及 V2（无线索）"
+            "在同一 Judge 和同一条件下的弱回答胜率差：", "",
+            f"- 基线弱回答（自然线索版）胜率为 {b_weak}。若明显高于 V4 的基线弱回答胜率，"
+            "说明自然度可能是表层线索生效的调节变量：线索越自然、越与内容耦合，越容易误导 Judge。",
+            f"- Reason-then-Judge 的弱回答胜率为 {r_weak}。若该干预能把胜率压回 V2 水平，"
+            "说明显式比较内容质量可能有助于抵抗自然化的表层说服线索。",
+            "- V5 改写受长度上限约束（不超过 V2 原文 1.6 倍），以降低长度对 V5/V4 对照的混淆。", ""]
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
+    global JUDGE_API_KEY, JUDGE_MODEL_NAME, JUDGE_BASE_URL, JUDGE_API_STYLE
+    global JUDGE2_API_KEY, JUDGE2_MODEL_NAME, JUDGE2_BASE_URL
+    global JUDGE2_API_STYLE, JUDGE3_API_KEY, JUDGE3_MODEL_NAME, JUDGE3_BASE_URL
+    global JUDGE3_API_STYLE
     parser = argparse.ArgumentParser()
     parser.add_argument("--mock", action="store_true", help="Test the pipeline without API calls")
     parser.add_argument(
@@ -792,13 +1134,14 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="Run only the first N questions (smoke tests)")
     parser.add_argument("--fresh", action="store_true", help="Start new prompt/output/log files")
     parser.add_argument(
-        "--answer-version", choices=("1", "2", "3", "4"),
+        "--answer-version", choices=("1", "2", "3", "4", "5"),
         help="Candidate answer set: 1=larger quality gap, 2=close quality, "
              "3=verbosity bias (weak answer padded to >=2x length), "
-             "4=surface-persuasion bias (fixed authority/consensus/style/compassion cues)")
+             "4=surface-persuasion bias (fixed authority/consensus/style/compassion cues), "
+             "5=natural-cue bias (content-coupled authority/empathy woven in by LLM)")
     parser.add_argument(
         "--answer-versions", metavar="LIST",
-        help="Run multiple answer sets, e.g. 2,3,4 (results use VxRy folders)")
+        help="Run multiple answer sets, e.g. 2,4,5 (results use VxRy folders)")
     parser.add_argument(
         "--rounds", type=int,
         help="Number of independent runs for every selected answer version")
@@ -809,21 +1152,74 @@ def main() -> None:
         "--max-call-seconds", type=float, default=DEFAULT_MAX_CALL_SECONDS,
         help="Automatically skip the current question when one API call exceeds this time; 0 disables")
     parser.add_argument(
+        "--jury", action="store_true",
+        help="Multi-model jury: judge1/judge2 vote in parallel, judge3 breaks disagreements")
+    parser.add_argument("--judge1-key", help="API key for judge1 (overrides JUDGE_API_KEY)")
+    parser.add_argument("--judge1-model", help="Model name for judge1")
+    parser.add_argument("--judge1-url", help="Base URL for judge1")
+    parser.add_argument("--judge1-style", choices=("auto", "openai", "anthropic"),
+                        help="API protocol for judge1 (default: JUDGE_API_STYLE constant)")
+    parser.add_argument("--judge2-key", help="API key for jury judge2 (overrides JUDGE2_API_KEY)")
+    parser.add_argument("--judge2-model", help="Model name for jury judge2")
+    parser.add_argument("--judge2-url", help="Base URL for jury judge2")
+    parser.add_argument("--judge2-style", choices=("auto", "openai", "anthropic"),
+                        help="API protocol for jury judge2")
+    parser.add_argument("--judge3-key", help="API key for jury judge3/tie-breaker (overrides JUDGE3_API_KEY)")
+    parser.add_argument("--judge3-model", help="Model name for jury judge3")
+    parser.add_argument("--judge3-url", help="Base URL for jury judge3")
+    parser.add_argument("--judge3-style", choices=("auto", "openai", "anthropic"),
+                        help="API protocol for jury judge3")
+    parser.add_argument(
         "--first-output-timeout", type=float,
         default=DEFAULT_FIRST_OUTPUT_TIMEOUT_SECONDS,
         help="Fail one judgment and continue if the API returns nothing within this many seconds; 0 disables")
     args = parser.parse_args()
+    if args.judge1_key:
+        JUDGE_API_KEY = args.judge1_key
+    if args.judge1_model:
+        JUDGE_MODEL_NAME = args.judge1_model
+    if args.judge1_url:
+        JUDGE_BASE_URL = args.judge1_url
+    if args.judge1_style:
+        JUDGE_API_STYLE = args.judge1_style
+    if args.judge2_key:
+        JUDGE2_API_KEY = args.judge2_key
+    if args.judge2_model:
+        JUDGE2_MODEL_NAME = args.judge2_model
+    if args.judge2_url:
+        JUDGE2_BASE_URL = args.judge2_url
+    if args.judge2_style:
+        JUDGE2_API_STYLE = args.judge2_style
+    if args.judge3_key:
+        JUDGE3_API_KEY = args.judge3_key
+    if args.judge3_model:
+        JUDGE3_MODEL_NAME = args.judge3_model
+    if args.judge3_url:
+        JUDGE3_BASE_URL = args.judge3_url
+    if args.judge3_style:
+        JUDGE3_API_STYLE = args.judge3_style
     if args.mock and args.test_api:
         parser.error("--mock and --test-api cannot be used together")
+    if args.jury and not args.mock:
+        for slot in (2, 3):
+            if not judge_configured(slot):
+                parser.error(
+                    f"--jury 需要配置 Judge{slot} 的 API（JUDGE{slot}_API_KEY 或 "
+                    f"--judge{slot}-key）；当前未配置。")
     if args.api_test_timeout <= 0:
         parser.error("--api-test-timeout must be greater than zero")
     if args.test_api:
-        print(f"Testing Judge API | model={JUDGE_MODEL_NAME} | endpoint={_chat_completions_url(JUDGE_BASE_URL)}")
-        try:
-            result = test_api_connection(args.api_test_timeout)
-        except RuntimeError as exc:
-            parser.exit(1, f"API test failed: {exc}\n")
-        print(f"API test passed | model={result['model']} | latency={result['elapsed_seconds']:.2f}s")
+        slots = (1, 2, 3) if args.jury else (1,)
+        for slot in slots:
+            cfg = judge_api_config(slot)
+            print(f"Testing Judge{slot} API | model={cfg['model']} | style={cfg['api_style']} | "
+                  f"endpoint={_endpoint_url(cfg['base_url'], cfg['api_style'])}")
+            try:
+                result = test_api_connection(args.api_test_timeout, cfg)
+            except RuntimeError as exc:
+                parser.exit(1, f"Judge{slot} API test failed: {exc}\n")
+            print(f"Judge{slot} API test passed | model={result['model']} | "
+                  f"latency={result['elapsed_seconds']:.2f}s")
         return
     answer_versions, rounds, named_runs = choose_experiment_plan(args, parser)
     if args.limit is not None and not 1 <= args.limit <= 80:
@@ -851,43 +1247,51 @@ def main() -> None:
     if unknown_skip_ids:
         parser.error(f"unknown --skip-question IDs: {sorted(unknown_skip_ids)}")
     if not args.mock and not args.skip_api_check:
-        print(f"Checking Judge API before experiment | model={JUDGE_MODEL_NAME}")
-        try:
-            result = test_api_connection(args.api_test_timeout)
-        except RuntimeError as exc:
-            parser.exit(
-                1,
-                f"API check failed; no experiment files were changed: {exc}\n"
-                "Fix the API configuration, run --test-api for diagnostics, or use "
-                "--skip-api-check to bypass this check.\n",
-            )
-        print(f"API check passed | model={result['model']} | latency={result['elapsed_seconds']:.2f}s")
+        slots = (1, 2, 3) if args.jury else (1,)
+        for slot in slots:
+            cfg = judge_api_config(slot)
+            print(f"Checking Judge{slot} API before experiment | model={cfg['model']}")
+            try:
+                result = test_api_connection(args.api_test_timeout, cfg)
+            except RuntimeError as exc:
+                parser.exit(
+                    1,
+                    f"Judge{slot} API check failed; no experiment files were changed: {exc}\n"
+                    "Fix the API configuration, run --test-api for diagnostics, or use "
+                    "--skip-api-check to bypass this check.\n",
+                )
+            print(f"Judge{slot} API check passed | model={result['model']} | "
+                  f"latency={result['elapsed_seconds']:.2f}s")
     total_runs = len(answer_versions) * rounds
     print(
         f"Experiment plan: versions={','.join('V' + v for v in answer_versions)} | "
-        f"rounds={rounds} | total runs={total_runs}"
+        f"rounds={rounds} | total runs={total_runs} | jury={'on' if args.jury else 'off'}"
     )
     run_index = 0
     for answer_version in answer_versions:
         for round_number in range(1, rounds + 1):
             run_index += 1
-            run_name = f"V{answer_version}R{round_number}" if named_runs else None
-            configure_answer_version(answer_version, run_name)
+            run_name = (f"V{answer_version}R{round_number}"
+                        + ("_jury" if args.jury else "")) if named_runs else None
+            configure_answer_version(answer_version, run_name, jury=args.jury)
             display_name = run_name or f"V{answer_version} (legacy output paths)"
             print(f"\n=== [{run_index}/{total_runs}] Starting {display_name} ===", flush=True)
             if args.fresh:
-                for path in (PROMPTS_PATH, OUTPUTS_PATH, FAILURES_PATH):
+                for path in (PROMPTS_PATH, OUTPUTS_PATH, FAILURES_PATH, DISAGREEMENTS_PATH):
                     path.unlink(missing_ok=True)
             random.seed(SEED)
             run_judging(
                 questions, answers_by_version[answer_version], args.mock, args.limit,
                 skip_question_ids, args.max_call_seconds, args.first_output_timeout,
-                answer_version,
+                answer_version, jury=args.jury,
             )
             mapped, metrics = calculate_results(questions, truth, args.limit, answer_version)
             write_csv(MAPPED_PATH, mapped)
             write_csv(METRICS_PATH, metrics)
-            write_report(metrics, args.mock, answer_version)
+            jury_summary = (write_jury_disagreements(questions, truth, args.limit,
+                                                     answer_version)
+                            if args.jury else None)
+            write_report(metrics, args.mock, answer_version, jury_summary)
             print(
                 f"Completed {display_name}: {len(mapped)} complete questions. "
                 f"Report: {REPORT_PATH}",

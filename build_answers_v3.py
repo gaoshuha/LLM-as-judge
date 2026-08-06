@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import threading
 import time
@@ -32,7 +33,8 @@ from typing import Any
 
 # =========================================================
 # Step 0: 扩写模型的 API 配置（与 Judge 相互独立，可换成任何兼容服务）
-EXPAND_API_KEY = "PASTE_YOUR_API_KEY_HERE"
+# 优先读取环境变量 EXPAND_API_KEY，未设置时使用占位符。
+EXPAND_API_KEY = os.environ.get("EXPAND_API_KEY", "PASTE_YOUR_EXPAND_API_KEY_HERE")
 EXPAND_MODEL_NAME = "deepseek-v4-flash"
 EXPAND_BASE_URL = "https://api.deepseek.com/v1"
 

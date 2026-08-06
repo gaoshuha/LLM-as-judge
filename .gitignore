@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器/工具缓存
+.kagent/
+.idea/
+.vscode/
+*.swp
+
+# 环境变量与密钥（禁止提交）
+.env
+*.env
+*.key
+
+# API 断点续跑进度文件（可由脚本重新生成）
+answers_v3_progress.jsonl
+answers_v5_progress.jsonl
+
+# 运行期临时文件
+*.tmp
+*.log
